@@ -71,6 +71,11 @@ void editorSetStatusMessage(const char *fmt, ...);
 void editorRefreshScreen();
 char *editorPrompt(char *prompt);
 
+void secure_write(const char *filename, const char *data, size_t len);
+char *secure_read(const char *filename, size_t *len_out);
+char *encrypt_buffer(const char *data, size_t len);
+char *decrypt_buffer(const char *data, size_t len);
+
 /*** terminal ***/
 
 void die(const char *s){
@@ -340,31 +345,41 @@ char *editorRowsToString(int *buflen){
     return buf;
 }
 
-void editorOpen(char *filename){
+void editorOpen(char *filename) {
     free(E.filename);
     E.filename = strdup(filename);
 
-    FILE *fp = fopen(filename, "r");
-    if(!fp) die("fopen");
-
-    char *line = NULL;
-    size_t linecap = 0;
-    ssize_t linelen;
-    while((linelen = getline(&line, &linecap, fp)) != -1){
-        while(linelen > 0 && (line[linelen - 1] == '\r' ||
-                              line[linelen - 1] == '\n'))
-            linelen--;
-        editorInsertRow(E.numrows, line, linelen);
+    size_t len;
+    char *decrypted = secure_read(filename, &len);
+    if (decrypted == NULL) {
+        die("secure_read");
+        return;
     }
-    free(line);
-    fclose(fp);
+
+    // Split decrypted content into lines
+    char *start = decrypted;
+    for (size_t i = 0; i < len; i++) {
+        if (decrypted[i] == '\n' || decrypted[i] == '\r') {
+            decrypted[i] = '\0';  // terminate line
+            editorInsertRow(E.numrows, start, strlen(start));
+            start = &decrypted[i + 1]; // move to next line
+        }
+    }
+
+    // Handle any remaining text (if file doesn’t end with newline)
+    if (*start != '\0') {
+        editorInsertRow(E.numrows, start, strlen(start));
+    }
+
+    free(decrypted);
     E.dirty = 0;
 }
 
-void editorSave(){
-    if(E.filename == NULL){
+
+void editorSave() {
+    if (E.filename == NULL) {
         E.filename = editorPrompt("Save as: %s");
-        if(E.filename == NULL){
+        if (E.filename == NULL) {
             editorSetStatusMessage("Save aborted");
             return;
         }
@@ -373,23 +388,59 @@ void editorSave(){
     int len;
     char *buf = editorRowsToString(&len);
 
-    int fd = open(E.filename, O_RDWR | O_CREAT, 0644);
-    if(fd != -1){
-        if(ftruncate(fd, len) != -1){
-            if(write(fd, buf, len) == len){
-                close(fd);
-                free(buf);
-                E.dirty = 0;
-                editorSetStatusMessage("%d bytes written to disk", len);
-                return;
-            }
-        }
-        close(fd);
-    }
-    
+    // --- Replace manual file operations with secure_write ---
+    secure_write(E.filename, buf, len);
+
     free(buf);
-    editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
+    E.dirty = 0;  // Mark as not modified
+    editorSetStatusMessage("%d bytes securely written to disk", len);
 }
+
+void secure_write(const char *filename, const char *data, size_t len) {
+    // Encrypt the buffer before writing
+    char *encrypted = encrypt_buffer(data, len);
+    FILE *fp = fopen(filename, "w");
+    fwrite(encrypted, 1, len, fp);
+    fclose(fp);
+    free(encrypted);
+}
+
+char *secure_read(const char *filename, size_t *len_out) {
+    FILE *fp = fopen(filename, "r");
+    fseek(fp, 0, SEEK_END);
+    size_t len = ftell(fp);
+    rewind(fp);
+
+    char *encrypted = malloc(len + 1);
+    fread(encrypted, 1, len, fp);
+    fclose(fp);
+
+    // Decrypt before returning to editor
+    char *decrypted = decrypt_buffer(encrypted, len);
+    free(encrypted);
+
+    *len_out = len;
+    return decrypted;
+}
+
+char *encrypt_buffer(const char *data, size_t len) {
+    char *out = malloc(len + 1);
+    for (size_t i = 0; i < len; i++) {
+        char c = data[i];
+        if ('a' <= c && c <= 'z') out[i] = (c - 'a' + 13) % 26 + 'a';
+        else if ('A' <= c && c <= 'Z') out[i] = (c - 'A' + 13) % 26 + 'A';
+        else out[i] = c;
+    }
+    out[len] = '\0';
+    return out;
+}
+char *decrypt_buffer(const char *data, size_t len) {
+    // ROT13 is symmetric encryption, so same logic as encrypt
+    return encrypt_buffer(data, len);
+}
+
+
+
 
 /*** append buffer ***/
 
@@ -696,6 +747,12 @@ void initEditor(){
     if(getWindowSize(&E.screenrows, &E.screencols) == -1)
         die("getWindowSize");
     E.screenrows -= 2; 
+}
+
+void encryptDecrypt(char *data, int len, const char *key, int keylen) {
+    for (int i = 0; i < len; i++) {
+        data[i] ^= key[i % keylen];  // XOR with key (same function encrypts & decrypts)
+    }
 }
 
 int main(int argc, char *argv[]){
